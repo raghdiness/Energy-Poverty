@@ -1,441 +1,375 @@
-# energy_poverty_app.py
-# Energy Poverty Risk Predictor — hardened for multiple CSV variants
-# - Handles LSOA 2011/2021 code headers and Local Authority code variants
-# - Normalizes fuel-poverty column names across official CSVs
-# - Derives missing columns from the others (proportion, counts, totals)
-# - Graceful diagnostics instead of hard crashes
-# - CLI: `--cli` to export CSV, `--test` to run normalization tests
+# Energy Poverty Risk Predictor — Streamlit App (Day‑1 MVP)
 
-from __future__ import annotations
-
-import argparse
 import io
-import math
-import sys
+import textwrap
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import streamlit as st
+from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (accuracy_score, classification_report,
+                             confusion_matrix, roc_auc_score)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-# --- Optional: scikit-learn for the model UI (installed via requirements.txt) ---
-try:
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import roc_auc_score, classification_report
-    from sklearn.linear_model import LogisticRegression
-    SKLEARN_AVAILABLE = True
-except Exception:
-    SKLEARN_AVAILABLE = False
-
-# --- Streamlit (app will still provide CLI/tests without it) ---
-try:
-    import streamlit as st
-    STREAMLIT_AVAILABLE = True
-except Exception:
-    STREAMLIT_AVAILABLE = False
-
-# --------------------------------------------------------------------------------------
-# Column normalization utilities
-# --------------------------------------------------------------------------------------
+# ----------------------------
+# Utilities
+# ----------------------------
 
 def _norm(s: str) -> str:
-    return ''.join(ch for ch in s.lower() if ch.isalnum())
-
-# Known header variants across official releases (examples; not exhaustive)
-LSOA_CANDIDATES = [
-    'LSOA_Code', 'LSOA code', 'LSOA Code', 'LSOA11CD', 'LSOA code (2011)', 'LSOA21CD', 'LSOA code (2021)',
-    'LSOA_CODE', 'lsoa_code'
-]
-LA_CANDIDATES = [
-    'Local_Authority_Code', 'Local Authority Code', 'LAD code', 'LAD22CD', 'LAD23CD', 'LAD21CD', 'LAD20CD', 'LAD19CD',
-    'LAD17CD', 'LA_Code', 'LADCD'
-]
-# Fuel poverty measures
-TOT_HH_CANDIDATES = [
-    'Estimated_number_of_households', 'Estimated number of households', 'Total households', 'Households', 'TotHH'
-]
-FP_HH_CANDIDATES = [
-    'Estimated_number_of_households_in_fuel_poverty', 'Estimated number of households in fuel poverty',
-    'Households in fuel poverty', 'Fuel poor households', 'FP households', 'Num fuel poor'
-]
-PROP_FP_CANDIDATES = [
-    'Proportion_of_households_fuel_poor_(%)', 'Proportion of households fuel poor (%)',
-    'Fuel poverty rate (%)', 'Fuel poverty proportion (%)', 'Fuel poverty (%)', 'FP rate (%)'
-]
-
-@dataclass
-class FuelColumns:
-    lsoa: str
-    la: Optional[str]
-    total_hh: Optional[str]
-    fp_hh: Optional[str]
-    prop_pct: Optional[str]
+    """Normalize a column name: lowercase + only letters/numbers/underscore."""
+    return "".join(ch if ch.isalnum() else "_" for ch in s.strip().lower())
 
 
-def find_first_present(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
-    cols = {_norm(c): c for c in df.columns}
-    for cand in candidates:
-        key = _norm(cand)
-        if key in cols:
-            return cols[key]
-    return None
+def _rename_like(df: pd.DataFrame, mapping: Dict[str, List[str]]) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Return a copy of df with standardized column names based on candidate lists.
 
+    Parameters
+    ----------
+    df: the original dataframe
+    mapping: dict where keys are canonical names (e.g., 'lsoa_code') and values are
+             lists of candidate source header strings (case/spacing-insensitive)
 
-def identify_fuel_columns(df: pd.DataFrame) -> FuelColumns:
-    lsoa = find_first_present(df, LSOA_CANDIDATES)
-    la = find_first_present(df, LA_CANDIDATES)
-    total_hh = find_first_present(df, TOT_HH_CANDIDATES)
-    fp_hh = find_first_present(df, FP_HH_CANDIDATES)
-    prop_pct = find_first_present(df, PROP_FP_CANDIDATES)
-    if not lsoa:
-        raise KeyError("Could not find an LSOA code column. Saw: " + ', '.join(map(str, df.columns)))
-    return FuelColumns(lsoa, la, total_hh, fp_hh, prop_pct)
-
-
-def coerce_numeric(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors='coerce')
-
-
-# --------------------------------------------------------------------------------------
-# Data loaders — keep your existing URLs; these functions just normalize after read_csv
-# --------------------------------------------------------------------------------------
-DEFAULT_FUEL_URL = (
-    # Tip: set st.secrets["FUEL_URL"] to override in Cloud without code changes
-    None
-)
-DEFAULT_IMD_URL = None  # Your IMD loader can stay as-is if you already have a URL
-
-
-@st.cache_data(show_spinner=True) if STREAMLIT_AVAILABLE else (lambda f: f)
-def load_fuel_poverty(url: Optional[str] = DEFAULT_FUEL_URL, *, uploaded: Optional[io.BytesIO] = None) -> pd.DataFrame:
-    """Load fuel poverty data from a URL or uploaded CSV and normalize headers/derived fields.
-    Expected outputs after normalization:
-    - 'LSOA_Code'
-    - 'Local_Authority_Code' (optional)
-    - 'Estimated_number_of_households'
-    - 'Estimated_number_of_households_in_fuel_poverty'
-    - 'Proportion_of_households_fuel_poor_(%)'
+    Returns
+    -------
+    (new_df, used) where used maps canonical->original header actually used
     """
-    if uploaded is not None:
-        df = pd.read_csv(uploaded)
-    else:
-        if url is None:
-            # Fall back: ask user to supply file/URL in the UI. We still return an empty frame here.
-            return pd.DataFrame()
-        df = pd.read_csv(url)
+    norm_cols = {col: _norm(col) for col in df.columns}
+    inv = {v: k for k, v in norm_cols.items()}  # normalized -> original
 
-    cols = identify_fuel_columns(df)
+    used: Dict[str, str] = {}
+    for canon, candidates in mapping.items():
+        # normalize candidates and try to find the first that exists
+        for cand in candidates:
+            nc = _norm(cand)
+            if nc in inv:
+                used[canon] = inv[nc]
+                break
 
-    # Start by copying through the minimally required columns
-    out = pd.DataFrame()
-    out['LSOA_Code'] = df[cols.lsoa].astype(str).str.strip()
-    if cols.la:
-        out['Local_Authority_Code'] = df[cols.la].astype(str).str.strip()
-
-    # Bring over whatever exists
-    if cols.total_hh:
-        out['Estimated_number_of_households'] = coerce_numeric(df[cols.total_hh])
-    if cols.fp_hh:
-        out['Estimated_number_of_households_in_fuel_poverty'] = coerce_numeric(df[cols.fp_hh])
-    if cols.prop_pct:
-        out['Proportion_of_households_fuel_poor_(%)'] = coerce_numeric(df[cols.prop_pct])
-
-    # Derive missing pieces from the others
-    tot = out.get('Estimated_number_of_households')
-    fp = out.get('Estimated_number_of_households_in_fuel_poverty')
-    prop = out.get('Proportion_of_households_fuel_poor_(%)')
-
-    if tot is None and fp is not None and prop is not None:
-        denom = prop / 100.0
-        denom = denom.replace(0, np.nan)
-        out['Estimated_number_of_households'] = fp / denom
-    if fp is None and tot is not None and prop is not None:
-        out['Estimated_number_of_households_in_fuel_poverty'] = (tot * (prop / 100.0))
-    if prop is None and tot is not None and fp is not None:
-        denom = tot.replace(0, np.nan)
-        out['Proportion_of_households_fuel_poor_(%)'] = (fp / denom) * 100.0
-
-    # Final sanity: ensure numeric columns present
-    for c in [
-        'Estimated_number_of_households',
-        'Estimated_number_of_households_in_fuel_poverty',
-        'Proportion_of_households_fuel_poor_(%)',
-    ]:
-        if c not in out.columns:
-            out[c] = np.nan
-        out[c] = coerce_numeric(out[c])
-
-    # Drop rows without LSOA codes
-    out = out.dropna(subset=['LSOA_Code']).drop_duplicates('LSOA_Code')
-
-    return out
+    # Build rename dict for those found
+    rename_dict = {used[k]: k for k in used}
+    new_df = df.rename(columns=rename_dict).copy()
+    return new_df, used
 
 
-@st.cache_data(show_spinner=True) if STREAMLIT_AVAILABLE else (lambda f: f)
-def load_imd(url: Optional[str] = DEFAULT_IMD_URL, *, uploaded: Optional[io.BytesIO] = None) -> pd.DataFrame:
-    """Load IMD data and normalize an LSOA code column. We keep only LSOA code + IMD rank/decile if present."""
-    if uploaded is not None:
-        df = pd.read_csv(uploaded)
-    else:
-        if url is None:
-            return pd.DataFrame()
-        df = pd.read_csv(url)
-
-    # Try to find an LSOA column
-    lsoa_col = find_first_present(df, LSOA_CANDIDATES)
-    if not lsoa_col:
-        raise KeyError("Could not find an LSOA column in IMD dataset.")
-
-    out = pd.DataFrame({'LSOA_Code': df[lsoa_col].astype(str).str.strip()})
-
-    # Optional IMD fields (many names exist)
-    imd_rank = find_first_present(df, ['IMD Rank', 'Index of Multiple Deprivation (Rank)', 'IMD_Rank', 'imd_rank'])
-    imd_dec = find_first_present(df, ['IMD Decile', 'IMD_Decile', 'imd_decile', 'Index of Multiple Deprivation (Decile)'])
-    if imd_rank:
-        out['IMD_Rank'] = coerce_numeric(df[imd_rank])
-    if imd_dec:
-        out['IMD_Decile'] = coerce_numeric(df[imd_dec])
-    return out.dropna(subset=['LSOA_Code']).drop_duplicates('LSOA_Code')
-
-
-# --------------------------------------------------------------------------------------
-# Feature building
-# --------------------------------------------------------------------------------------
-
-def build_dataset(
-    *,
-    threshold_pct: float = 10.0,
-    top_quantile: float = 0.2,
-    fuel: Optional[pd.DataFrame] = None,
-    imd: Optional[pd.DataFrame] = None,
-) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
-    """Return (X, y, meta) for classification.
-    y = 1 if fuel-poverty proportion >= threshold_pct, else 0.
-    Features: proportion, IMD features (if present), simple ratios.
-    """
-    if fuel is None:
-        fuel = load_fuel_poverty()
-    if imd is None:
-        imd = load_imd()
-
-    if fuel.empty:
-        raise ValueError("Fuel dataset is empty — provide a URL or upload a CSV via the sidebar.")
-
-    df = fuel.copy()
-
-    # Label
-    df['label'] = (df['Proportion_of_households_fuel_poor_(%)'] >= threshold_pct).astype(int)
-
-    # Merge IMD
-    if imd is not None and not imd.empty:
-        df = df.merge(imd, on='LSOA_Code', how='left')
-
-    # Simple engineered features
-    df['fp_rate'] = df['Proportion_of_households_fuel_poor_(%)'] / 100.0
-    # Densities unavailable without area; for now keep a minimal robust set
-
-    # X / y / meta
-    feature_candidates = [
-        'fp_rate',
-        'IMD_Rank',
-        'IMD_Decile',
-        'Estimated_number_of_households',
-    ]
-    X_cols = [c for c in feature_candidates if c in df.columns]
-    X = df[X_cols].fillna(df[X_cols].median(numeric_only=True))
-    y = df['label']
-
-    meta_cols = ['LSOA_Code']
-    if 'Local_Authority_Code' in df.columns:
-        meta_cols.append('Local_Authority_Code')
-    meta = df[meta_cols]
-
-    return X, y, meta
-
-
-# --------------------------------------------------------------------------------------
-# Streamlit UI
-# --------------------------------------------------------------------------------------
-
-def app():
-    st.set_page_config(page_title="Energy Poverty Risk Predictor", layout='wide')
-    st.title("Energy Poverty Risk Predictor")
-    st.caption("Hardened data loader that accepts multiple official CSV header variants.")
-
-    with st.sidebar:
-        st.subheader("Data input")
-        use_custom = st.toggle("Provide data files/URLs", value=False, help="If off, the app expects repo/default URLs inside the code or secrets.")
-        fuel_upload = None
-        imd_upload = None
-        fuel_url = None
-        imd_url = None
-        if use_custom:
-            fuel_upload = st.file_uploader("Fuel-poverty CSV", type=['csv'])
-            fuel_url = st.text_input("...or Fuel CSV URL (optional)") or None
-            imd_upload = st.file_uploader("IMD CSV (optional)", type=['csv'])
-            imd_url = st.text_input("...or IMD CSV URL (optional)") or None
-
-        st.subheader("Labeling")
-        threshold = st.slider("Fuel-poverty threshold (%)", min_value=5.0, max_value=30.0, value=10.0, step=0.5)
-        test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05)
-        model_choice = st.selectbox("Model", ["Logistic Regression"])  # Keep simple for MVP
-
-    # Load datasets with resilience
-    try:
-        fuel = load_fuel_poverty(url=fuel_url, uploaded=fuel_upload)
-    except Exception as e:
-        st.error(f"Fuel dataset load error: {e}")
-        st.stop()
-
-    try:
-        imd = load_imd(url=imd_url, uploaded=imd_upload) if (imd_upload or imd_url) else pd.DataFrame()
-    except Exception as e:
-        st.warning(f"IMD dataset load problem (continuing without IMD): {e}")
-        imd = pd.DataFrame()
-
-    if fuel.empty:
-        with st.expander("Diagnostics: fuel dataset is empty", expanded=True):
-            st.write("No data loaded. Provide a CSV or set a URL in the sidebar or code.")
-        st.stop()
-
-    # Show diagnostics
-    with st.expander("Diagnostics: fuel dataset preview", expanded=False):
-        st.write(f"Rows: {len(fuel):,}")
-        st.dataframe(fuel.head(20))
-        st.code("
-".join(map(str, fuel.columns.tolist())), language='text')
-
-    # Build features
-    try:
-        X, y, meta = build_dataset(threshold_pct=threshold, fuel=fuel, imd=imd)
-    except Exception as e:
-        st.error(f"Dataset build error: {e}")
-        st.stop()
-
-    st.subheader("Training & Evaluation")
-    if not SKLEARN_AVAILABLE:
-        st.warning("scikit-learn is not available. The dashboard will show data only.")
-        st.dataframe(pd.concat([meta.reset_index(drop=True), y.rename('label')], axis=1).head(25))
-        st.stop()
-
-    # Train/test split
-    X_train, X_test, y_train, y_test, meta_train, meta_test = train_test_split(
-        X, y, meta, test_size=test_size, random_state=42, stratify=y if y.nunique() > 1 else None
-    )
-
-    # Simple model
-    model = LogisticRegression(max_iter=1000, n_jobs=1)
-    model.fit(X_train, y_train)
-    proba = model.predict_proba(X_test)[:, 1]
-    preds = (proba >= 0.5).astype(int)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        try:
-            auc = roc_auc_score(y_test, proba) if y_test.nunique() > 1 else float('nan')
-        except ValueError:
-            auc = float('nan')
-        st.metric("ROC AUC", f"{auc:.3f}" if not math.isnan(auc) else "n/a")
-    with col2:
-        st.metric("Positives in test", int(y_test.sum()))
-
-    st.code(classification_report(y_test, preds, zero_division=0), language='text')
-
-    # Export
-    export_df = meta_test.copy()
-    export_df['pred_proba'] = proba
-    export_df['pred_label'] = preds
-    st.download_button("Download predictions (CSV)", export_df.to_csv(index=False).encode('utf-8'), file_name='energy_poverty_predictions.csv', mime='text/csv')
-
-
-# --------------------------------------------------------------------------------------
-# Tests (run with: python energy_poverty_app.py --test)
-# --------------------------------------------------------------------------------------
-
-def _df_from(headers: Dict[str, Iterable], rows: List[List]) -> pd.DataFrame:
-    cols = list(headers.keys())
-    df = pd.DataFrame(rows, columns=cols)
-    # Rename columns to the headers (some inputs will be odd spellings)
-    df.columns = cols
+def _coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 
-def run_tests() -> None:
-    # 1) Exact expected headers
-    df1 = pd.DataFrame({
-        'LSOA_Code': ['A', 'B'],
-        'Local_Authority_Code': ['L1', 'L2'],
-        'Estimated_number_of_households': [1000, 1200],
-        'Estimated_number_of_households_in_fuel_poverty': [100, 240],
-        'Proportion_of_households_fuel_poor_(%)': [10.0, 20.0],
-    })
-    n1 = load_fuel_poverty(uploaded=io.BytesIO(df1.to_csv(index=False).encode('utf-8')))
-    assert set(['LSOA_Code', 'Estimated_number_of_households', 'Estimated_number_of_households_in_fuel_poverty', 'Proportion_of_households_fuel_poor_(%)']).issubset(n1.columns)
+# ----------------------------
+# Data loading
+# ----------------------------
 
-    # 2) Variant headers (common official spellings) without totals — derive totals
-    df2 = pd.DataFrame({
-        'LSOA11CD': ['X'],
-        'LAD22CD': ['LAD'],
-        'Estimated number of households in fuel poverty': [50],
-        'Proportion of households fuel poor (%)': [25.0],
-    })
-    n2 = load_fuel_poverty(uploaded=io.BytesIO(df2.to_csv(index=False).encode('utf-8')))
-    assert 'Estimated_number_of_households' in n2.columns
-    assert math.isclose(float(n2['Estimated_number_of_households'].iloc[0]), 200.0, rel_tol=1e-6)
-
-    # 3) Variant headers with totals + proportion — derive fp count
-    df3 = pd.DataFrame({
-        'LSOA21CD': ['Y'],
-        'Local Authority Code': ['LA'],
-        'Total households': [800],
-        'Fuel poverty rate (%)': [12.5],
-    })
-    n3 = load_fuel_poverty(uploaded=io.BytesIO(df3.to_csv(index=False).encode('utf-8')))
-    assert 'Estimated_number_of_households_in_fuel_poverty' in n3.columns
-    assert math.isclose(float(n3['Estimated_number_of_households_in_fuel_poverty'].iloc[0]), 100.0, rel_tol=1e-6)
-
-    # 4) IMD loader LSOA variants
-    imd = pd.DataFrame({'LSOA code (2011)': ['A', 'B'], 'IMD Rank': [1000, 2000]})
-    imd_n = load_imd(uploaded=io.BytesIO(imd.to_csv(index=False).encode('utf-8')))
-    assert 'LSOA_Code' in imd_n.columns and 'IMD_Rank' in imd_n.columns
-
-    print("All tests passed ✔")
+SAMPLE_CSV = """
+LSOA Code,LSOA Name,Estimated number of households,Estimated number of households in fuel poverty,Proportion of households fuel poor (%)
+E01000001,City of London 001A,850,95,11.18
+E01000002,City of London 001B,1000,60,6.00
+E01000003,City of London 001C,750,120,16.00
+E01000005,City of London 001E,600,48,8.00
+""".strip()
 
 
-# --------------------------------------------------------------------------------------
-# Entrypoint
-# --------------------------------------------------------------------------------------
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--cli', action='store_true', help='Export a CSV of predictions without a UI')
-    parser.add_argument('--test', action='store_true', help='Run quick tests and exit')
-    parser.add_argument('--fuel', type=str, default=None, help='Fuel CSV path/URL')
-    parser.add_argument('--imd', type=str, default=None, help='IMD CSV path/URL')
-    args = parser.parse_args()
+@st.cache_data(show_spinner=False)
+def load_sample() -> pd.DataFrame:
+    return pd.read_csv(io.StringIO(SAMPLE_CSV))
 
-    if args.test:
-        run_tests()
-        sys.exit(0)
 
-    if STREAMLIT_AVAILABLE and not args.cli:
-        app()
-    else:
-        # Minimal CLI: require files, train a tiny model, write CSV
-        if not SKLEARN_AVAILABLE:
-            print("scikit-learn not available; cannot run CLI model.")
-            sys.exit(2)
-        # Load via pandas directly (URLs or local paths)
-        fuel = load_fuel_poverty(url=args.fuel)
-        imd = load_imd(url=args.imd) if args.imd else pd.DataFrame()
-        X, y, meta = build_dataset(fuel=fuel, imd=imd)
-        X_train, X_test, y_train, y_test, meta_train, meta_test = train_test_split(
-            X, y, meta, test_size=0.2, random_state=42, stratify=y if y.nunique() > 1 else None
+def load_from_upload(upload) -> Optional[pd.DataFrame]:
+    if upload is None:
+        return None
+    try:
+        return pd.read_csv(upload)
+    except Exception:
+        upload.seek(0)
+        try:
+            return pd.read_excel(upload)
+        except Exception as e:  # pragma: no cover
+            st.error(f"Could not read file: {e}")
+            return None
+
+
+# ----------------------------
+# Feature engineering & label
+# ----------------------------
+
+CANDIDATES = {
+    "lsoa_code": [
+        "lsoa_code", "LSOA Code", "LSOA_Code", "LSOA code", "LSOA2021CD", "LSOA11CD",
+    ],
+    "lsoa_name": [
+        "lsoa_name", "LSOA Name", "LSOA_Name", "LSOA name", "LSOA2021NM", "LSOA11NM",
+    ],
+    "households": [
+        "Estimated number of households", "Estimated_number_of_households", "households",
+        "Total households",
+    ],
+    "households_in_fp": [
+        "Estimated number of households in fuel poverty",
+        "Estimated_number_of_households_in_fuel_poverty",
+        "households_in_fuel_poverty",
+    ],
+    "pct_fuel_poor": [
+        "Proportion of households fuel poor (%)",
+        "Proportion_of_households_fuel_poor_(%)",
+        "fuel_poverty_%", "fuel_poverty_percent", "pct_fuel_poor",
+    ],
+    # optional extras that we may one-hot encode if present
+    "region": ["Region", "region_name", "region"],
+    "imd_decile": ["IMD_Decile", "imd_decile", "IMD decile", "Index of Multiple Deprivation Decile"],
+}
+
+
+def derive_missing_fields(df: pd.DataFrame) -> pd.DataFrame:
+    # Ensure core numeric columns are numeric
+    df = _coerce_numeric(df, ["households", "households_in_fp", "pct_fuel_poor"])  # type: ignore
+
+    # Derive pct if missing
+    if "pct_fuel_poor" not in df.columns and {"households", "households_in_fp"}.issubset(df.columns):
+        df["pct_fuel_poor"] = (df["households_in_fp"] / df["households"]) * 100.0
+
+    # Derive households_in_fp if missing
+    if "households_in_fp" not in df.columns and {"households", "pct_fuel_poor"}.issubset(df.columns):
+        df["households_in_fp"] = (df["households"] * df["pct_fuel_poor"] / 100.0).round()
+
+    # Derive households if missing
+    if "households" not in df.columns and {"households_in_fp", "pct_fuel_poor"}.issubset(df.columns):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            denom = df["pct_fuel_poor"] / 100.0
+            df["households"] = np.where(denom > 0, df["households_in_fp"] / denom, np.nan)
+
+    return df
+
+
+@dataclass
+class Dataset:
+    X: pd.DataFrame
+    y: pd.Series
+    meta: pd.DataFrame
+
+
+def build_dataset(raw_df: pd.DataFrame, threshold_pct: float) -> Dataset:
+    # Standardize names
+    std_df, used = _rename_like(raw_df, CANDIDATES)
+
+    required_any = [["pct_fuel_poor"], ["households", "households_in_fp"]]
+    if not any(all(c in std_df.columns for c in group) for group in required_any):
+        missing = "pct_fuel_poor" if "pct_fuel_poor" not in std_df.columns else "households/households_in_fp"
+        raise ValueError(
+            "Dataset missing required columns. Need either 'pct_fuel_poor' OR both 'households' and 'households_in_fp'.
+"
+            f"Detected columns: {list(raw_df.columns)}
+"
+            f"Mapped columns: {used}"
         )
-        model = LogisticRegression(max_iter=1000, n_jobs=1)
-        model.fit(X_train, y_train)
-        proba = model.predict_proba(X_test)[:, 1]
-        out = meta_test.copy()
-        out['pred_proba'] = proba
-        out['pred_label'] = (proba >= 0.5).astype(int)
-        out.to_csv('energy_poverty_predictions.csv', index=False)
-        print('Wrote energy_poverty_predictions.csv with', len(out), 'rows')
+
+    std_df = derive_missing_fields(std_df)
+
+    # Drop rows without an LSOA code if present
+    if "lsoa_code" in std_df.columns:
+        std_df = std_df.dropna(subset=["lsoa_code"]).drop_duplicates("lsoa_code")
+
+    # Target
+    std_df["is_fuel_poor"] = (std_df["pct_fuel_poor"] >= threshold_pct).astype(int)
+
+    # Features: numeric + optional categoricals
+    feature_cols_num = [c for c in ["pct_fuel_poor", "households", "households_in_fp"] if c in std_df.columns]
+    cat_cols = [c for c in ["region", "imd_decile"] if c in std_df.columns]
+
+    X = std_df[feature_cols_num + cat_cols].copy()
+    y = std_df["is_fuel_poor"].copy()
+    meta_cols = [c for c in ["lsoa_code", "lsoa_name"] if c in std_df.columns]
+    meta = std_df[meta_cols + ["pct_fuel_poor"]].copy()
+
+    return Dataset(X=X, y=y, meta=meta)
+
+
+# ----------------------------
+# Modeling
+# ----------------------------
+
+def make_pipeline(numeric_cols: List[str], categorical_cols: List[str]) -> Pipeline:
+    transformers = []
+    if numeric_cols:
+        transformers.append(("num", StandardScaler(), numeric_cols))
+    if categorical_cols:
+        transformers.append(("cat", OneHotEncoder(handle_unknown="ignore"), categorical_cols))
+
+    pre = ColumnTransformer(transformers=transformers) if transformers else "passthrough"
+    clf = LogisticRegression(max_iter=1000)
+    return Pipeline(steps=[("pre", pre), ("clf", clf)])
+
+
+# ----------------------------
+# App UI
+# ----------------------------
+
+st.set_page_config(page_title="Energy Poverty Risk Predictor", layout="wide")
+
+st.title("Energy Poverty Risk Predictor ")
+st.caption("Fast MVP: robust to column name variations and friendly diagnostics.")
+
+with st.sidebar:
+    st.header("Settings")
+    source = st.radio("Data source", ["Sample", "Upload CSV"], index=0)
+    threshold = st.slider("Fuel-poverty threshold (%)", min_value=5.0, max_value=25.0, value=10.0, step=0.5)
+    test_size = st.slider("Test size", min_value=0.1, max_value=0.4, value=0.2, step=0.05)
+
+    st.markdown("**Expected label:** 1 if `pct_fuel_poor ≥ threshold`, else 0.")
+
+# Load data
+if source == "Sample":
+    df_raw = load_sample()
+else:
+    uploaded = st.file_uploader("Upload a CSV or Excel with LSOA-level fuel poverty data", type=["csv", "xls", "xlsx"])
+    df_raw = load_from_upload(uploaded) if uploaded is not None else None
+
+if df_raw is None:
+    st.info("Upload a file or switch to the sample to get started.")
+    st.stop()
+
+st.subheader("1) Data preview & column mapping")
+st.dataframe(df_raw.head(10))
+
+# Try to map columns and build dataset
+try:
+    data = build_dataset(df_raw, threshold_pct=threshold)
+    st.success("Columns detected & engineered successfully.")
+except Exception as e:
+    st.error("Could not build dataset. See details below.")
+    st.exception(e)
+    st.stop()
+
+# Show mapping summary
+std_df, used_map = _rename_like(df_raw, CANDIDATES)
+col1, col2 = st.columns(2)
+with col1:
+    st.write("**Canonical → Source mapping**")
+    if used_map:
+        st.json(used_map)
+    else:
+        st.write("No canonical columns found; using raw column names.")
+with col2:
+    st.write("**Engineered features present**")
+    present = [c for c in ["pct_fuel_poor", "households", "households_in_fp", "region", "imd_decile"] if c in std_df.columns]
+    st.write(present)
+
+# Train/test split and model
+X, y, meta = data.X, data.y, data.meta
+num_cols = [c for c in ["pct_fuel_poor", "households", "households_in_fp"] if c in X.columns and pd.api.types.is_numeric_dtype(X[c])]
+cat_cols = [c for c in ["region", "imd_decile"] if c in X.columns and not pd.api.types.is_numeric_dtype(X[c])]
+
+if y.nunique() < 2:
+    st.warning("Your threshold produced only one class — adjust the slider until both classes exist.")
+    st.stop()
+
+X_train, X_test, y_train, y_test, meta_train, meta_test = train_test_split(
+    X, y, meta, test_size=test_size, random_state=42, stratify=y
+)
+
+pipe = make_pipeline(num_cols, cat_cols)
+pipe.fit(X_train, y_train)
+
+proba = pipe.predict_proba(X_test)[:, 1]
+preds = (proba >= 0.5).astype(int)
+
+st.subheader("2) Model performance (Logistic Regression)")
+colA, colB, colC = st.columns(3)
+with colA:
+    st.metric("Accuracy", f"{accuracy_score(y_test, preds):.3f}")
+with colB:
+    try:
+        auc = roc_auc_score(y_test, proba)
+        st.metric("ROC AUC", f"{auc:.3f}")
+    except Exception:
+        st.metric("ROC AUC", "n/a")
+with colC:
+    cm = confusion_matrix(y_test, preds)
+    st.write("Confusion matrix:")
+    st.write(pd.DataFrame(cm, index=["Actual 0", "Actual 1"], columns=["Pred 0", "Pred 1"]))
+
+with st.expander("Classification report"):
+    st.text(classification_report(y_test, preds))
+
+# Rankings export
+st.subheader("3) High-risk areas & export")
+rank_df = meta_test.copy()
+rank_df["proba_fuel_poor"] = proba
+rank_df = rank_df.sort_values("proba_fuel_poor", ascending=False)
+
+st.dataframe(rank_df.head(20))
+
+csv_bytes = rank_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="Download predictions as CSV",
+    data=csv_bytes,
+    file_name="energy_poverty_risk_rankings.csv",
+    mime="text/csv",
+)
+
+# Helpful how-to (make sure the string closes properly!)
+st.subheader("How to run locally (optional)")
+st.code(textwrap.dedent('''
+# 1) Create & activate a virtual environment (Windows PowerShell example)
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+
+# 2) Install dependencies
+pip install streamlit pandas numpy scikit-learn
+
+# 3) Run the app
+streamlit run energy_poverty_app.py
+
+# (Optional) Run a quick CLI self-test without Streamlit
+python energy_poverty_app.py --cli
+''').strip())
+
+# ----------------------------
+# Minimal self-tests (do not change app behavior)
+# ----------------------------
+
+def _self_tests() -> None:
+    # Variant headers case 1
+    df1 = pd.DataFrame({
+        "LSOA_Code": ["A", "B"],
+        "Estimated_number_of_households": [100, 200],
+        "Estimated_number_of_households_in_fuel_poverty": [10, 30],
+    })
+    d1 = build_dataset(df1, threshold_pct=10)
+    assert "pct_fuel_poor" in _rename_like(derive_missing_fields(_rename_like(df1, CANDIDATES)[0]), CANDIDATES)[0].columns
+    assert d1.y.iloc[0] == 1  # 10/100 = 10% → label 1
+
+    # Variant headers case 2 (percent provided, counts missing)
+    df2 = pd.DataFrame({
+        "LSOA code": ["C", "D"],
+        "fuel_poverty_%": [5.0, 12.0],
+    })
+    d2 = build_dataset(df2, threshold_pct=10)
+    assert d2.y.tolist() == [0, 1]
+
+# CLI mode for quick smoke tests
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cli", action="store_true", help="Run a quick CLI smoke test & write CSV")
+    args = parser.parse_args()
+    if args.cli:
+        print("Running CLI self-tests...")
+        _self_tests()
+        out = pd.read_csv(io.StringIO(SAMPLE_CSV))
+        d = build_dataset(out, threshold_pct=10)
+        X_train, X_test, y_train, y_test = train_test_split(d.X, d.y, test_size=0.2, random_state=42, stratify=d.y)
+        pipe = make_pipeline([c for c in ["pct_fuel_poor", "households", "households_in_fp"] if c in d.X.columns],
+                             [c for c in ["region", "imd_decile"] if c in d.X.columns and not pd.api.types.is_numeric_dtype(d.X[c])])
+        pipe.fit(X_train, y_train)
+        proba = pipe.predict_proba(X_test)[:, 1]
+        meta = d.meta.loc[X_test.index].copy()
+        meta["proba_fuel_poor"] = proba
+        meta.sort_values("proba_fuel_poor", ascending=False).to_csv("energy_poverty_risk_rankings.csv", index=False)
+        print("Wrote energy_poverty_risk_rankings.csv")
