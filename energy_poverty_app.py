@@ -161,10 +161,12 @@ def build_dataset(raw_df: pd.DataFrame, threshold_pct: float) -> Dataset:
     required_any = [["pct_fuel_poor"], ["households", "households_in_fp"]]
     if not any(all(c in std_df.columns for c in group) for group in required_any):
         missing = "pct_fuel_poor" if "pct_fuel_poor" not in std_df.columns else "households/households_in_fp"
-        raise ValueError(
-            "Dataset missing required columns. Need either 'pct_fuel_poor' OR both 'households' and 'households_in_fp'.
-"
-            f"Detected columns: {list(raw_df.columns)}
+                msg = textwrap.dedent(
+            f"""Dataset missing required columns. Need either 'pct_fuel_poor' OR both 'households' and 'households_in_fp'.
+Detected columns: {list(raw_df.columns)}
+Mapped columns: {used}"""
+        ).strip()
+        raise ValueError(msg)}
 "
             f"Mapped columns: {used}"
         )
