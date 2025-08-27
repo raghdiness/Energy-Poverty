@@ -167,7 +167,6 @@ Detected columns: {list(raw_df.columns)}
 Mapped columns: {used}"""
         ).strip()
         raise ValueError(msg)
-"
             f"Mapped columns: {used}"
         )
 
@@ -375,5 +374,6 @@ if __name__ == "__main__":
         meta["proba_fuel_poor"] = proba
         meta.sort_values("proba_fuel_poor", ascending=False).to_csv("energy_poverty_risk_rankings.csv", index=False)
         print("Wrote energy_poverty_risk_rankings.csv")
+
 
 
