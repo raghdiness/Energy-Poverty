@@ -14,6 +14,106 @@ import streamlit as st
 from sklearn.compose import ColumnTransformer
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
+
+# --- Smart split helper to avoid scikit-learn stratification errors on tiny/imbalanced datasets ---
+# We define it here so it is available to both Streamlit and CLI modes without importing extra modules at the top level.
+def smart_train_test_split(X, y, meta, test_size=0.2, random_state=42, allow_autogrow=True):
+    """
+    Robust wrapper around train_test_split that:
+    - Uses stratify=y when feasible.
+    - If infeasible (too few samples per class for the requested test_size),
+      optionally auto-increases test_size just enough to enable stratification (capped at 0.5),
+      otherwise falls back to a non-stratified split.
+
+    Returns: X_train, X_test, y_train, y_test, meta_train, meta_test, info(dict)
+    """
+    import numpy as np
+    from sklearn.model_selection import train_test_split as _tts
+
+    n = len(y)
+    y_arr = np.asarray(y)
+    classes, counts = np.unique(y_arr, return_counts=True)
+
+    # Build info payload for the UI
+    def _as_key(v):
+        try:
+            return int(v)
+        except Exception:
+            return str(v)
+    info = {
+        "n": int(n),
+        "classes": { _as_key(c): int(k) for c, k in zip(classes, counts) },
+        "stratified": True,
+        "test_size_used": float(test_size),
+        "note": "",
+    }
+
+    # Helper: is a stratified split possible with this test_size?
+    def strat_ok(ts: float) -> bool:
+        if len(classes) < 2:
+            return False  # need at least two classes for stratification
+        # Need at least one test sample and one train sample per class
+        # Under stratification, each class contributes roughly ts * count to test
+        # and (1-ts) * count to train; the floor of those must be >= 1.
+        for c_count in counts:
+            if c_count < 2:  # cannot place 1 in train and 1 in test
+                return False
+            if int(np.floor(ts * c_count)) < 1:
+                return False
+            if int(np.floor((1.0 - ts) * c_count)) < 1:
+                return False
+        # Also need the global test/train to be able to host all classes
+        n_test = int(np.floor(ts * n)) if ts < 1.0 else int(ts)
+        n_train = n - n_test
+        if n_test < len(classes) or n_train < len(classes):
+            return False
+        return True
+
+    # Path 1: stratification is fine as-is
+    ts_used = float(test_size)
+    if strat_ok(ts_used):
+        X_tr, X_te, y_tr, y_te, meta_tr, meta_te = _tts(
+            X, y_arr, meta, test_size=ts_used, random_state=random_state, stratify=y_arr, shuffle=True
+        )
+        info["stratified"] = True
+        info["test_size_used"] = ts_used
+        return X_tr, X_te, y_tr, y_te, meta_tr, meta_te, info
+
+    # Path 2: try to auto-grow test_size just enough to enable stratification
+    if allow_autogrow and len(classes) >= 2:
+        import math
+        # Minimum needed to get >=1 test sample per class and >=1 train per class
+        # For the rarest class with count r, need ts >= 1/r and (1-ts) >= 1/r -> ts <= 1 - 1/r
+        r = int(counts.min())
+        lower = 1.0 / r
+        upper = 1.0 - (1.0 / r)
+        # Also need at least len(classes) test samples in total
+        lower = max(lower, len(classes) / max(n, 1))
+        # Start from current test_size
+        ts_candidate = max(ts_used, lower)
+        # Cap to a sane upper bound; if impossible, give up
+        if ts_candidate < upper and ts_candidate <= 0.5 and strat_ok(ts_candidate):
+            X_tr, X_te, y_tr, y_te, meta_tr, meta_te = _tts(
+                X, y_arr, meta, test_size=ts_candidate, random_state=random_state, stratify=y_arr, shuffle=True
+            )
+            info["stratified"] = True
+            info["test_size_used"] = float(ts_candidate)
+            info["note"] = f"Auto-increased test_size to {ts_candidate:.2f} to enable stratification."
+            return X_tr, X_te, y_tr, y_te, meta_tr, meta_te, info
+
+    # Path 3: fall back to non-stratified split with a clear note
+    X_tr, X_te, y_tr, y_te, meta_tr, meta_te = _tts(
+        X, y_arr, meta, test_size=ts_used, random_state=random_state, stratify=None, shuffle=True
+    )
+    info["stratified"] = False
+    info["test_size_used"] = ts_used
+    info["note"] = (
+        "Stratified split was infeasible for the current label counts and test_size. "
+        "Fell back to a non-stratified split. Consider increasing test size, lowering the threshold, "
+        "or using more rows so each class has >= 2 samples in both train and test."
+    )
+    return X_tr, X_te, y_tr, y_te, meta_tr, meta_te, info
+
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
@@ -237,7 +337,7 @@ def build_dataset(
 # Safer train/test split that avoids scikit-learn's stratify errors
 # -------------------------
 
-def robust_train_test_split(
+def smart_train_test_split(
     X: pd.DataFrame,
     y: pd.Series,
     meta: pd.DataFrame,
@@ -326,7 +426,7 @@ with colB:
     st.write(["IMD_decile"])
 
 # Split (robust)
-X_train, X_test, y_train, y_test, meta_train, meta_test, split_info = robust_train_test_split(
+X_train, X_test, y_train, y_test, meta_train, meta_test, split_info = smart_train_test_split(
     X, y, meta, test_size=test_size, random_state=42
 )
 if split_info["warning"]:
@@ -370,3 +470,14 @@ preview["pred_high_risk"] = y_pred
 st.dataframe(preview.head(25))
 
 st.caption("MVP note: the app gracefully handles sparse labels and schema variants; for best results, tune the threshold/top-q to ensure both classes are present.")
+
+
+# --- Back-compat alias: older code may call robust_train_test_split; route it to the smarter splitter ---
+try:
+    smart_train_test_split  # type: ignore[name-defined]
+    def robust_train_test_split(X, y, meta, test_size=0.2, random_state=42, allow_autogrow=True):
+        return smart_train_test_split(
+            X, y, meta, test_size=test_size, random_state=random_state, allow_autogrow=allow_autogrow
+        )
+except NameError:
+    pass
