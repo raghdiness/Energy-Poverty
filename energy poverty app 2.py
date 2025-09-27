@@ -45,12 +45,10 @@ def main():
     st.title("Energy Poverty Risk Predictor")
 
     fuel_url = st.text_input("Fuel poverty CSV URL or path")
-    imd_url = st.text_input("IMD CSV URL or path")
 
-    if fuel_url and imd_url:
-        fuel_df = load_and_clean_fuel_data(fuel_url)
-        imd_df = pd.read_csv(imd_url)
-
+if fuel_url:
+    fuel_df = load_and_clean_fuel_data(fuel_url)
+    merged = fuel_df.copy()
         # Merge on LSOA Code
         merged = pd.merge(fuel_df, imd_df, left_on="LSOA Code", right_on=imd_df.columns[0], how="inner")
 
