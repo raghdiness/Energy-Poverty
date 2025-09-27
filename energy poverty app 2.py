@@ -56,7 +56,7 @@ if fuel_url:
     merged["label"] = (merged["Proportion of households fuel poor (%)"] >= 10).astype(int)
 
         # --- Select only numeric columns for features ---
-     drop_cols = [
+    drop_cols = [
             "LSOA Code",
             "LSOA Name",
             "Local Authority Code",
