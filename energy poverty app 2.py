@@ -48,9 +48,10 @@ fuel_url = st.text_input("Fuel poverty CSV URL or path")
 
 if fuel_url:
     fuel_df = load_and_clean_fuel_data(fuel_url)
-merged = fuel_df.copy()
-merged["label"] = (
-    merged["Proportion of households fuel poor (%)"] >= 10
+fuel_df = load_and_clean_fuel_data(fuel_url)
+
+fuel_df["label"] = (
+    fuel_df["Proportion of households fuel poor (%)"] >= 10
 ).astype(int)
 
 drop_cols = [
@@ -62,9 +63,10 @@ drop_cols = [
     "label"
 ]
 
-X = merged.drop(columns=drop_cols, errors="ignore").select_dtypes(include=["number"])
-y = merged["label"].values
-meta = merged[["LSOA Code", "LSOA Name"]]
+X = fuel_df.drop(columns=drop_cols, errors="ignore").select_dtypes(include=["number"])
+y = fuel_df["label"].values
+meta = fuel_df[["LSOA Code", "LSOA Name"]]
+
 
 st.write("Feature dtypes:", X.dtypes)
 
