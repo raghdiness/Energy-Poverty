@@ -50,13 +50,13 @@ if fuel_url:
     fuel_df = load_and_clean_fuel_data(fuel_url)
     merged = fuel_df.copy()
         # Merge on LSOA Code
-        merged = pd.merge(fuel_df, imd_df, left_on="LSOA Code", right_on=imd_df.columns[0], how="inner")
+    merged = pd.merge(fuel_df, imd_df, left_on="LSOA Code", right_on=imd_df.columns[0], how="inner")
 
         # Build label: example threshold at 10%
-        merged["label"] = (merged["Proportion of households fuel poor (%)"] >= 10).astype(int)
+    merged["label"] = (merged["Proportion of households fuel poor (%)"] >= 10).astype(int)
 
         # --- Select only numeric columns for features ---
-        drop_cols = [
+     drop_cols = [
             "LSOA Code",
             "LSOA Name",
             "Local Authority Code",
