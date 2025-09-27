@@ -44,7 +44,7 @@ def smart_train_test_split(X, y, meta, test_size=0.2, random_state=42, allow_aut
 def main():
     st.title("Energy Poverty Risk Predictor")
 
-    fuel_url = st.text_input("Fuel poverty CSV URL or path")
+fuel_url = st.text_input("Fuel poverty CSV URL or path")
 
 if fuel_url:
     fuel_df = load_and_clean_fuel_data(fuel_url)
