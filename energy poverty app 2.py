@@ -64,26 +64,26 @@ if fuel_url:
             "Region",
             "label"
         ]
-        X = merged.drop(columns=drop_cols, errors="ignore").select_dtypes(include=["number"])
-        y = merged["label"].values
-        meta = merged[["LSOA Code", "LSOA Name"]]
+    X = merged.drop(columns=drop_cols, errors="ignore").select_dtypes(include=["number"])
+    y = merged["label"].values
+    meta = merged[["LSOA Code", "LSOA Name"]]
 
-        st.write("Feature dtypes:", X.dtypes)
+    st.write("Feature dtypes:", X.dtypes)
 
         # Train/test split
-        X_train, X_test, y_train, y_test, meta_train, meta_test = smart_train_test_split(
+    X_train, X_test, y_train, y_test, meta_train, meta_test = smart_train_test_split(
             X, y, meta, test_size=0.2, random_state=42, allow_autogrow=True
         )
 
         # Build pipeline
-        pipe = Pipeline([
+    pipe = Pipeline([
             ("scaler", StandardScaler()),
             ("clf", LogisticRegression(max_iter=1000, class_weight="balanced"))
         ])
 
-        pipe.fit(X_train, y_train)
-        acc = pipe.score(X_test, y_test)
-        st.write("Test accuracy:", acc)
+    pipe.fit(X_train, y_train)
+    acc = pipe.score(X_test, y_test)
+    st.write("Test accuracy:", acc)
 
 if __name__ == "__main__":
     main()
